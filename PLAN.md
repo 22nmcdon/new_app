@@ -164,6 +164,91 @@ function weights pitch distance in semitones and onset distance in beats;
 deletions are cheaper than a wrong-pitch match so the algorithm prefers "you
 missed it" over "you played it a fifth off".
 
+### 4.4 Microphone variability — measured, not assumed
+
+The obvious objection to this whole project is that people's microphones vary
+wildly. Before building anything, the core claim was tested against synthesized
+tones with exact ground truth, pushed through models of real microphone chains.
+
+**Pitch is close to immune.** A cheap mic has poor frequency *response*, a high
+noise floor and distortion; none of these shift the *periodicity* of the
+waveform, and periodicity is all YIN measures. Median error vs. ground truth:
+
+| Condition | C2 (65 Hz) | D3 | D4 | A5 |
+|---|---|---|---|---|
+| clean reference | +0.3¢ | +1.2¢ | +0.7¢ | +1.0¢ |
+| laptop mic, HPF 150 Hz | +0.1¢ | +0.8¢ | +0.7¢ | +1.0¢ |
+| aggressive HPF 300 Hz | +0.1¢ | +0.4¢ | +0.6¢ | +1.0¢ |
+| noisy room, SNR 10 dB | +0.2¢ | +1.2¢ | +1.1¢ | +1.6¢ |
+| clipping / overdriven input | +0.2¢ | +1.2¢ | +0.8¢ | +1.2¢ |
+| AGC pumping | +0.3¢ | +1.2¢ | +0.7¢ | +1.0¢ |
+| live room, RT60 1.2 s | +0.3¢ | +0.9¢ | +1.1¢ | +1.3¢ |
+| Bluetooth HFP narrowband | +0.0¢ | +0.7¢ | +0.8¢ | +0.9¢ |
+| worst realistic laptop combo | +1.7¢ | +2.4¢ | +1.9¢ | +2.1¢ |
+
+A 10× margin against the 20¢ tolerance in the worst case. Note the C2 column
+under a 300 Hz high-pass: the fundamental is entirely absent and it still tracks
+to 0.1¢, because the harmonics preserve the period.
+
+Two real effects did show up. **Strong spectral tilt biases the estimate** — a
+realistically dull mic (LPF 2 kHz) costs +3.5¢, a very dull one +6.5¢ — but the
+bias is systematic per (mic, instrument, register), so it is near-constant
+across takes and largely cancels in the longitudinal analysis that the product
+depends on. And **low SNR causes octave errors** (10% of frames at SNR 6 dB on
+A5), which is what the octave guard in §3 is for.
+
+**Onsets are the fragile axis.** Detections for an 8-note sequence:
+
+| Condition | notes detected (of 8) |
+|---|---|
+| clean / HPF / Bluetooth | 7 |
+| small room, RT60 0.4 s | 9 |
+| live room, RT60 1.2 s | **22** |
+| noisy room, SNR 10 dB | **40** |
+
+Reverb and noise make spectral flux *invent* notes. Phantom onsets would wreck
+DTW alignment and pollute the history with bogus extra-note penalties.
+
+**Consequence for the design: segment on pitch, not on energy.** Note boundaries
+come from f0 stability and confidence transitions, which inherit the robustness
+measured above. Spectral flux is demoted to a tiebreaker for consecutive notes
+at the *same* pitch, the one case pitch alone cannot segment.
+
+### 4.5 Browser and OS voice processing
+
+A bigger practical threat than mic quality, and one no amount of DSP fixes.
+`getUserMedia` defaults to echo cancellation, noise suppression and AGC, all
+tuned for speech; noise suppression will spectrally gate a sustained instrument
+tone. Disable explicitly:
+
+```js
+getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false,
+                        autoGainControl: false, latency: 0 } })
+```
+
+What cannot be disabled from JS is OS-level processing (macOS Voice Isolation,
+Windows "audio enhancements"). That needs detection — probe with a known tone,
+look for gating artifacts — and a prompt telling the user where to turn it off.
+Bluetooth is the other one: opening an input stream flips the headset into HFP,
+and while pitch survives it intact, latency jumps to 100–300 ms with poor jitter.
+
+### 4.6 Setup check and per-metric degradation
+
+Because of the above, a bad input chain must **never** produce a wrong number.
+On first run and on any device change, measure the input: noise floor, sample
+rate, track settings actually granted vs. requested, latency offset and jitter,
+and gating artifacts. Then enable metrics individually:
+
+| Measurement | Requires | If it fails |
+|---|---|---|
+| Pitch, stability | almost nothing | (effectively always available) |
+| Timing | latency jitter IQR ≤ 25 ms | timing not scored; take shows pitch only |
+| Note completion | SNR ≥ ~12 dB | warn that dropped/extra notes may be spurious |
+
+The app says which metrics are live and why, in plain language. "Intonation
+only — your Bluetooth headset's timing is too unstable to measure" is an honest
+product. A confident timing score derived from a 200 ms Bluetooth delay is not.
+
 ---
 
 ## 5. The scoring model
@@ -266,10 +351,10 @@ runnable.
 
 | # | Milestone | Est. | Done when |
 |---|---|---|---|
-| **M0** | **Spike** — throwaway | 1 wk | YIN in a worklet tracks a real instrument within 5¢ of a reference tuner; round-trip latency measured on 3 devices; SAB transport proven. Findings written up, code deleted. |
+| **M0** | **Spike** — throwaway | 1 wk | YIN in a worklet tracks a real instrument within 5¢ of a reference tuner *on a built-in laptop mic in a live room*; `getUserMedia` constraints verified as actually granted (and OS-level processing detected) on macOS, Windows and iOS; round-trip latency and jitter measured on 3 devices; SAB transport proven. Findings written up, code deleted. |
 | **M1** | **Shell + tuner** | 1 wk | App shell, mic permission flow, live pitch ribbon on canvas, working chromatic tuner. **Ships as v0.1** — a good tuner is useful on its own and gets real-device feedback early. |
 | **M2** | **Exercise engine** | 2 wks | Exercise params → rendered notes → on-screen strip; sample-accurate metronome with count-in; latency calibration wizard; instrument presets. |
-| **M3** | **Scoring** | 2 wks | Onset detection, note segmentation, DTW alignment, the rubric, and a take-summary screen with per-note verdicts. **This is the riskiest milestone** — budget for the scores to be wrong at first and for the fix to be in segmentation, not the rubric. |
+| **M3** | **Scoring** | 2 wks | Pitch-driven note segmentation (flux as repeat-note tiebreaker only, per §4.4), DTW alignment, the rubric, per-metric degradation gates, and a take-summary screen with per-note verdicts. **This is the riskiest milestone** — budget for the scores to be wrong at first and for the fix to be in segmentation, not the rubric. |
 | **M4** | **Memory** | 1.5 wks | IndexedDB persistence, history charts, SRS scheduler, "build my session". |
 | **M5** | **Weak-spot mining** | 2 wks | Aggregation queries, significance thresholds, finding templates, generated drills in the queue. |
 | **M6** | **Ship** | 1.5 wks | PWA/offline, onboarding, export/import, empty and error states, storage management. Public v1. |
@@ -304,7 +389,9 @@ Audio code is untestable by vibes, so this is decided up front:
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Pitch tracking too noisy on real instruments in real rooms | Fatal | M0 spike exists precisely to find this out in week 1, on real devices, before anything is built on top of it |
+| Pitch tracking too noisy on real instruments in real rooms | Fatal | **Largely retired** by the §4.4 simulation: ≤2.4¢ error under a worst-case laptop chain, against a 20¢ tolerance. M0 confirms it on real hardware |
+| Phantom onsets in live/noisy rooms corrupt alignment and history | High | Measured in §4.4 (up to 40 detections for 8 notes). Segment on pitch rather than energy; flux only breaks ties between same-pitch notes |
+| OS-level voice processing mangles sustained tones, undisableable from JS | High | Detect via a known-tone probe; prompt the user to turn it off; degrade to pitch-only if they don't |
 | Timing scores meaningless from input latency | High | Calibration wizard in M2; refuse to score timing when calibration confidence is low, rather than reporting a number we don't believe |
 | Metronome bleed pollutes onsets | Medium | Narrow-band click + confidence-gated suppression + a headphone nudge |
 | Scores feel unfair → users stop trusting it | Fatal (product, not technical) | Always show tolerance and per-note evidence; let the user play back the audio of any note the app marked wrong. If they can hear it was fine, the app is wrong and that's a bug report |
